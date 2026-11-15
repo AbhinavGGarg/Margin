@@ -1,0 +1,10 @@
+[project]
+name = "margin"
+version = "0.1.0"
+description = "Tap a line of your handwritten notes, hear the moment it was explained."
+requires-python = ">=3.9"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning", "ignore:Using `httpx`"]
