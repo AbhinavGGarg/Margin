@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Margin</title>
+<meta name="description" content="Tap a line of your handwritten notes and hear the moment it was explained.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23fffdf8'/%3E%3Crect x='9' y='4' width='2' height='24' fill='%23d9534a'/%3E%3Crect x='14' y='10' width='12' height='4' rx='1' fill='%23ffe45c'/%3E%3Crect x='14' y='18' width='9' height='2' rx='1' fill='%231d1b18'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="bar">
+  <a class="wordmark" href="#/" aria-label="Margin home">Margin</a>
+  <div class="bar-title" id="bar-title"></div>
+  <nav class="bar-actions" id="bar-actions"></nav>
+</header>
+
+<main id="view" tabindex="-1"></main>
+
+<div class="modal" id="map-modal" hidden>
+  <div class="modal-scrim" data-close></div>
+  <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="map-title">
+    <header class="modal-head">
+      <h2 id="map-title">How your notes were matched</h2>
+      <button class="icon-button" data-close aria-label="Close">×</button>
+    </header>
+    <p class="modal-lead">
+      Each row is one line of your notes and each column is a stretch of the video. Darker means more
+      evidence that the line is about that moment. The red path is the set of links that scores highest
+      overall while keeping your notes in the order things were said.
+    </p>
+    <div class="map-wrap">
+      <canvas id="map-canvas"></canvas>
+      <div class="map-tip" id="map-tip" hidden></div>
+    </div>
+    <p class="modal-foot" id="map-foot"></p>
+  </section>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
