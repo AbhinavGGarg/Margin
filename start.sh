@@ -30,7 +30,6 @@ if [ ! -f .venv/.installed ] || [ requirements.txt -nt .venv/.installed ] || [ s
   # Optional parts. Each one is tried on its own; Margin still runs if one can't be installed.
   optional=(
     "fastembed>=0.4"       # matching by meaning (downloads a ~130 MB model the first time it is used)
-    "google-genai>=1.0"    # handwriting reading with Gemini (needs GEMINI_API_KEY in .env)
     "pillow-heif>=0.16"    # iPhone .heic photos
   )
   if [ "$(uname)" = "Darwin" ]; then

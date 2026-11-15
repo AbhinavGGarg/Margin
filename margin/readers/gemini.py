@@ -117,7 +117,7 @@ class GeminiReader(Reader):
                 {},
             ):
                 try:
-                    interaction = client.interactions.create(model=model, input=content, **extra)
+                    interaction = client.interactions.create(model=model, input=content, timeout=45, **extra)
                     text = getattr(interaction, "output_text", None)
                     if text:
                         return text
@@ -182,11 +182,13 @@ class GeminiReader(Reader):
                 lowered = last_error.lower()
                 if "api key" in lowered or "api_key" in lowered or "permission" in lowered or "401" in lowered:
                     raise ReaderError("Gemini rejected the API key. Check GEMINI_API_KEY in the .env file.") from exc
-                if "429" in lowered or "quota" in lowered or "rate limit" in lowered or "exhausted" in lowered:
-                    raise ReaderError("Gemini's free limit was hit. Wait a minute and try again.") from exc
+                limited = "429" in lowered or "quota" in lowered or "rate limit" in lowered or "exhausted" in lowered
                 if not tried_fallbacks:
+                    # A model can be missing, or not offered on this key's plan: try the others.
                     tried_fallbacks = True
                     attempts.extend(self._fallback_models(client))
+                if limited and not attempts:
+                    raise ReaderError("Gemini's free limit was hit. Wait a minute and try again.") from exc
         raise ReaderError("Gemini couldn't read the photo (" + last_error[:160] + ").")
 
 

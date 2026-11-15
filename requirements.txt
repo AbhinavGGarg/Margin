@@ -1,7 +1,8 @@
-# Core (required)
+# What Margin needs everywhere (this is also what a serverless host installs).
 fastapi>=0.110
 uvicorn>=0.29
 python-multipart>=0.0.9
 numpy>=1.24
 pillow>=10.0
 youtube-transcript-api>=1.0
+google-genai>=1.0

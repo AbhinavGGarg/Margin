@@ -3,8 +3,17 @@ name = "margin"
 version = "0.1.0"
 description = "Tap a line of your handwritten notes, hear the moment it was explained."
 requires-python = ">=3.9"
+# Keep this list the same as requirements.txt (start.sh installs from that file).
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "python-multipart>=0.0.9",
+    "numpy>=1.24",
+    "pillow>=10.0",
+    "youtube-transcript-api>=1.0",
+    "google-genai>=1.0",
+]
 
-[tool.pytest.ini_options]
-pythonpath = ["."]
-testpaths = ["tests"]
-filterwarnings = ["ignore::DeprecationWarning", "ignore:Using `httpx`"]
+# Where Vercel finds the FastAPI app.
+[tool.vercel]
+entrypoint = "margin.server:app"

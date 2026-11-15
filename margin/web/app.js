@@ -1,4 +1,5 @@
-/* Margin: single-page interface. No build step, no dependencies. */
+/* Margin: single-page interface. No build step, no dependencies.
+   Sessions live in this browser (IndexedDB); the server only reads and links. */
 (function () {
   "use strict";
 
@@ -10,15 +11,18 @@
   const state = {
     status: null,        // /api/status
     session: null,       // the open session
+    imageUrl: null,      // object URL for the open session's page photo
     selected: null,      // index of the selected line
     mode: "page",        // "page" | "text"
     player: null,
     playerReady: false,
     pendingSeek: null,
     ticker: null,
-    pollTimer: null,
     playingLine: null,
     activeCaption: -1,
+    busy: false,
+    demoTimer: null,
+    hasSample: false,
   };
   // What the user typed on the home screen, kept so an error doesn't wipe it.
   const draft = { url: "", file: null, transcript: "", showTranscript: false, error: null };
@@ -32,19 +36,26 @@
     return (h ? h + ":" + String(m).padStart(2, "0") : m) + ":" + String(s).padStart(2, "0");
   };
   const CONFIDENCE = { high: "Strong match", medium: "Likely match", low: "Best guess", pinned: "Set by you", none: "No clear moment" };
+  const newId = () => Math.random().toString(36).slice(2, 10);
 
   async function api(path, options) {
     let response;
     try {
       response = await fetch(path, options);
     } catch (e) {
-      throw { error: "Can't reach Margin. Is it still running in the terminal?", code: "offline" };
+      throw { error: "Can't reach Margin. Check your connection and try again.", code: "offline" };
     }
     let body = null;
     try { body = await response.json(); } catch (e) { /* not JSON */ }
-    if (!response.ok) throw body && body.error ? body : { error: "Something went wrong (" + response.status + ").", code: "error" };
+    if (!response.ok) {
+      if (body && body.error) throw body;
+      if (response.status === 413) throw { error: "That photo is too large to upload. Try a smaller JPEG.", code: "image" };
+      if (response.status === 504) throw { error: "That took too long. Try again, or use a shorter video.", code: "timeout" };
+      throw { error: "Something went wrong (" + response.status + ").", code: "error" };
+    }
     return body;
   }
+  const form = (fields) => { const body = new FormData(); Object.keys(fields).forEach((k) => { const v = fields[k]; if (v instanceof Blob) body.append(k, v, v.name || "notes.jpg"); else body.append(k, v); }); return body; };
 
   let toastTimer = null;
   function toast(message) {
@@ -54,8 +65,61 @@
     toastTimer = setTimeout(() => { toastEl.hidden = true; }, 3200);
   }
 
+  // --- Sessions in this browser ---------------------------------------------
+  const store = (function () {
+    const memory = new Map(); // also the fallback when IndexedDB is unavailable (some private windows)
+    let opening = null;
+    function database() {
+      if (opening) return opening;
+      opening = new Promise((resolve) => {
+        if (!window.indexedDB) { resolve(null); return; }
+        let request;
+        try { request = indexedDB.open("margin", 1); } catch (e) { resolve(null); return; }
+        request.onupgradeneeded = () => request.result.createObjectStore("sessions", { keyPath: "id" });
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = request.onblocked = () => resolve(null);
+      });
+      return opening;
+    }
+    function run(mode, make) {
+      return database().then((db) => {
+        if (!db) throw new Error("no database");
+        return new Promise((resolve, reject) => {
+          const tx = db.transaction("sessions", mode);
+          const request = make(tx.objectStore("sessions"));
+          tx.oncomplete = () => resolve(request.result);
+          tx.onerror = tx.onabort = () => reject(tx.error);
+        });
+      });
+    }
+    return {
+      put(session) { memory.set(session.id, session); return run("readwrite", (s) => s.put(session)).catch(() => {}); },
+      get(id) { return run("readonly", (s) => s.get(id)).then((found) => found || memory.get(id) || null).catch(() => memory.get(id) || null); },
+      all() { return run("readonly", (s) => s.getAll()).then((found) => found || []).catch(() => Array.from(memory.values())); },
+      remove(id) { memory.delete(id); return run("readwrite", (s) => s.delete(id)).catch(() => {}); },
+    };
+  })();
+
+  /** Shrink a photo in the browser: faster uploads, and upright whatever the phone's EXIF says. */
+  async function shrink(file, maxSide) {
+    try {
+      const bitmap = await createImageBitmap(file);
+      const scale = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(bitmap.width * scale);
+      canvas.height = Math.round(bitmap.height * scale);
+      canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.88));
+      if (blob && blob.size > 0) return { blob, converted: true };
+    } catch (e) { /* e.g. HEIC outside Safari: send the original and let the server convert it */ }
+    return { blob: file, converted: false };
+  }
+  const dataUrlToBlob = (url) => fetch(url).then((r) => r.blob());
+  const blobToDataUrl = (blob) => new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = reject; reader.readAsDataURL(blob); });
+
   // --- Routing ---------------------------------------------------------------
   function route() {
+    if (state.busy) return;
     teardownSession();
     const match = location.hash.match(/^#\/s\/([A-Za-z0-9_-]+)/);
     if (match) openSession(match[1]);
@@ -79,11 +143,43 @@
   function setupNotice() {
     const s = state.status;
     if (!s || s.reader.active) return "";
-    const hasKey = s.reader.gemini.key;
-    const message = hasKey && !s.reader.gemini.installed
-      ? "A Gemini key is set, but the Gemini library isn't installed. Run <code>./start.sh</code> again."
-      : "No handwriting reader is set up yet. Add <code>GEMINI_API_KEY=…</code> to the <code>.env</code> file in the Margin folder and restart. On a Mac, running <code>./start.sh</code> also installs Apple's built-in reader, which needs no key.";
+    // No handwriting reader here (for example the hosted demo, which cannot use Apple Vision).
+    const message = state.hasSample
+      ? "This online copy can show you a finished example, but it can't read new photos. Press <strong>Try a sample</strong>, or run Margin on your own computer to use your notes."
+      : "This copy of Margin can't read new photos yet. Run it on a Mac with <code>./start.sh</code>, or set <code>GEMINI_API_KEY</code>.";
     return '<div class="notice warn">' + message + "</div>";
+  }
+
+  const DEMO = [
+    { text: "Photosynthesis = how plants make food", time: "0:07", at: 4, said: "…so <b>photosynthesis</b> is <b>how plants make</b> their own <b>food</b> using energy from sunlight…" },
+    { text: "– happens in chloroplasts", time: "0:23", at: 12, said: "…where does this actually <b>happen</b>? It <b>happens</b> inside the <b>chloroplasts</b>…" },
+    { text: "– light rxns in thylakoid membrane", time: "1:03", at: 30, said: "…the <b>light reactions</b> take place in the <b>thylakoid membrane</b>…" },
+    { text: "– water split → O₂ released", time: "1:19", at: 38, said: "…when <b>water</b> is <b>split</b>, <b>oxygen</b> gets <b>released</b> as a byproduct…" },
+    { text: "– Calvin cycle in stroma", time: "1:47", at: 52, said: "…the <b>Calvin cycle</b> happens in the <b>stroma</b>, the fluid that surrounds…" },
+  ];
+
+  function demoFigure() {
+    return '<figure class="demo" aria-label="Example: a line of handwritten notes linked to a moment in a video">' +
+      '<div class="demo-page">' + DEMO.map((d, i) => '<span class="hand" data-demo="' + i + '">' + esc(d.text) + "</span>").join("") + "</div>" +
+      '<div class="demo-video"><div class="demo-screen"><span class="demo-play">▶</span><span class="chip" id="demo-time"></span></div>' +
+      '<div class="demo-track"><span class="demo-fill" id="demo-fill"></span>' + DEMO.map((d) => '<span class="demo-tick" style="left:' + d.at + '%"></span>').join("") + "</div>" +
+      '<p class="demo-said" id="demo-said"></p></div></figure>';
+  }
+
+  function runDemo() {
+    clearInterval(state.demoTimer);
+    let index = 2;
+    const paint = () => {
+      const figure = view.querySelector(".demo");
+      if (!figure) { clearInterval(state.demoTimer); return; }
+      figure.querySelectorAll(".hand").forEach((el) => el.classList.toggle("on", Number(el.dataset.demo) === index));
+      document.getElementById("demo-time").textContent = "▶ " + DEMO[index].time;
+      document.getElementById("demo-said").innerHTML = DEMO[index].said;
+      document.getElementById("demo-fill").style.width = DEMO[index].at + "%";
+    };
+    paint();
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    state.demoTimer = setInterval(() => { index = (index + 1) % DEMO.length; paint(); }, 2600);
   }
 
   async function renderHome() {
@@ -92,27 +188,40 @@
     barActions.innerHTML = "";
     view.innerHTML =
       '<div class="home">' +
+      '<div class="hero"><div class="hero-copy">' +
       "<h1>Tap a line of your notes. <mark>Hear the moment</mark> it was explained.</h1>" +
       '<p class="lead">Paste the video you studied from and add a photo of your handwritten notes. Margin links every line to the second it was said.</p>' +
+      "</div>" + demoFigure() + "</div>" +
       '<form class="card form" id="create" novalidate>' +
       '<div id="form-error"></div>' +
       '<div id="setup-notice"></div>' +
-      '<div class="field"><label for="url">Video</label>' +
-      '<input class="input" id="url" type="url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://www.youtube.com/watch?v=…" value="' + esc(draft.url) + '"></div>' +
-      '<div class="field"><span class="label">Notes</span>' +
+      '<div class="form-grid">' +
+      '<div class="field"><label for="url">1 · The video</label>' +
+      '<input class="input" id="url" type="url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://www.youtube.com/watch?v=…" value="' + esc(draft.url) + '">' +
+      '<div class="hint">Any YouTube video with captions. Auto-generated captions are fine.</div></div>' +
+      '<div class="field"><span class="label">2 · Your notes</span>' +
       '<label class="drop" id="drop"><input id="file" type="file" accept="image/*,.heic,.heif" aria-label="Photo of your notes"><span id="drop-inner"></span></label>' +
-      '<div class="hint">One page per photo. Shoot from straight above in good light.</div></div>' +
+      '<div class="hint">One page per photo, taken from straight above in good light.</div></div>' +
+      "</div>" +
       '<div class="field" id="transcript-field"' + (draft.showTranscript ? "" : " hidden") + ">" +
       '<label for="transcript">Transcript</label>' +
       '<textarea class="textarea" id="transcript" spellcheck="false" placeholder="0:00&#10;so today we\'re going to talk about…&#10;0:07&#10;…">' + esc(draft.transcript) + "</textarea>" +
       '<div class="hint">On YouTube, open the video description, choose “Show transcript”, select everything in the panel and paste it here. SRT and VTT files work too.</div></div>' +
       '<div class="form-foot">' +
       '<button class="button primary" id="go" type="submit">Link my notes</button>' +
+      '<button class="button" type="button" id="sample" hidden>Try a sample</button>' +
       '<span class="status" id="reader-status"></span>' +
       '<button class="link-button" type="button" id="toggle-transcript">' + (draft.showTranscript ? "Use the video’s captions" : "Paste a transcript instead") + "</button>" +
       "</div></form>" +
       '<section class="recent" id="recent" hidden></section>' +
+      '<section class="how"><h2>How it works</h2><ol>' +
+      "<li><strong>It reads your handwriting.</strong> Every line of the page, and where it sits, so each one becomes a button.</li>" +
+      "<li><strong>It reads the video.</strong> The captions are cut into short overlapping moments, each with its timestamp.</li>" +
+      "<li><strong>It lines them up.</strong> Each line is scored against each moment by shared words and by meaning, then all the lines are matched together, in the order things were said.</li>" +
+      "</ol>" +
+      '<p class="how-foot">Your notes stay in this browser. Nothing is saved on a server.</p></section>' +
       "</div>";
+    runDemo();
 
     const urlInput = document.getElementById("url");
     const fileInput = document.getElementById("file");
@@ -132,13 +241,20 @@
       }
     }
     function paintError() {
-      document.getElementById("form-error").innerHTML = draft.error ? '<div class="notice error">' + esc(draft.error) + "</div>" : "";
+      const el = document.getElementById("form-error");
+      if (el) el.innerHTML = draft.error ? '<div class="notice error">' + esc(draft.error) + "</div>" : "";
     }
     function paintStatus() {
       const el = document.getElementById("reader-status");
       const notice = document.getElementById("setup-notice");
+      const go = document.getElementById("go");
+      const sample = document.getElementById("sample");
       if (el) el.textContent = readerSummary();
       if (notice) notice.innerHTML = setupNotice();
+      // Without a reader, the sample is the thing to press.
+      const noReader = !!state.status && !state.status.reader.active;
+      if (go) go.disabled = noReader;
+      if (sample) sample.classList.toggle("primary", noReader && state.hasSample);
     }
     paintDrop(); paintError(); paintStatus();
 
@@ -159,25 +275,31 @@
       if (draft.showTranscript) transcriptInput.focus();
     });
 
-    document.getElementById("create").addEventListener("submit", async (e) => {
+    document.getElementById("create").addEventListener("submit", (e) => {
       e.preventDefault();
       draft.error = null;
       if (!draft.url.trim()) draft.error = "Paste the link to the video first.";
       else if (!draft.file) draft.error = "Add a photo of your notes.";
       if (draft.error) { paintError(); return; }
-      const button = document.getElementById("go");
-      button.disabled = true;
-      const body = new FormData();
-      body.append("video_url", draft.url.trim());
-      body.append("notes", draft.file, draft.file.name);
-      if (draft.showTranscript && draft.transcript.trim()) body.append("transcript", draft.transcript);
+      createSession();
+    });
+
+    // A bundled example, when this copy of Margin ships one.
+    const sampleButton = document.getElementById("sample");
+    fetch("/static/sample.json", { method: "HEAD" }).then((r) => {
+      state.hasSample = r.ok;
+      if (r.ok && sampleButton.isConnected) { sampleButton.hidden = false; paintStatus(); }
+    }).catch(() => {});
+    sampleButton.addEventListener("click", async () => {
+      sampleButton.disabled = true;
       try {
-        const created = await api("/api/sessions", { method: "POST", body });
-        location.hash = "#/s/" + created.id;
+        const bundle = await api("/static/sample.json");
+        const session = Object.assign({}, bundle.session, { id: "sample", created: Date.now(), image: await dataUrlToBlob(bundle.image) });
+        await store.put(session);
+        location.hash = "#/s/sample";
       } catch (err) {
-        draft.error = err.error;
-        button.disabled = false;
-        paintError();
+        sampleButton.disabled = false;
+        toast("Couldn't load the sample.");
       }
     });
 
@@ -191,74 +313,99 @@
     };
     refreshStatus();
 
-    try {
-      const { sessions } = await api("/api/sessions");
-      const recent = document.getElementById("recent");
-      if (recent && sessions.length) {
-        recent.hidden = false;
-        recent.innerHTML = "<h2>Recent</h2><div class=\"recent-list\">" + sessions.map((s) =>
-          '<a class="recent-item" href="#/s/' + esc(s.id) + '">' +
-          '<img alt="" loading="lazy" src="https://i.ytimg.com/vi/' + esc(s.video_id) + '/mqdefault.jpg">' +
-          '<span class="meta"><span class="title">' + esc(s.title || "Untitled video") + "</span>" +
-          '<span class="sub">' + s.linked + " of " + s.lines + " lines linked" + (s.author ? " · " + esc(s.author) : "") + "</span></span>" +
-          '<button class="icon-button" data-delete="' + esc(s.id) + '" aria-label="Delete this session" title="Delete">×</button></a>'
-        ).join("") + "</div>";
-        recent.addEventListener("click", async (e) => {
-          const target = e.target.closest("[data-delete]");
-          if (!target) return;
-          e.preventDefault();
-          await api("/api/sessions/" + target.dataset.delete, { method: "DELETE" });
-          target.closest(".recent-item").remove();
-          if (!recent.querySelector(".recent-item")) recent.hidden = true;
-        });
-      }
-    } catch (e) { /* the list is optional */ }
+    const sessions = (await store.all()).sort((a, b) => (b.created || 0) - (a.created || 0)).slice(0, 12);
+    const recent = document.getElementById("recent");
+    if (recent && sessions.length) {
+      recent.hidden = false;
+      recent.innerHTML = "<h2>Your sessions</h2><div class=\"recent-list\">" + sessions.map((s) => {
+        const linked = s.lines.filter((l) => l.t != null).length;
+        return '<a class="recent-item" href="#/s/' + esc(s.id) + '">' +
+          '<img alt="" loading="lazy" src="https://i.ytimg.com/vi/' + esc(s.video.id) + '/mqdefault.jpg">' +
+          '<span class="meta"><span class="title">' + esc(s.video.title || "Untitled video") + "</span>" +
+          '<span class="sub">' + linked + " of " + s.lines.length + " lines linked" + (s.video.author ? " · " + esc(s.video.author) : "") + "</span></span>" +
+          '<button class="icon-button" data-delete="' + esc(s.id) + '" aria-label="Delete this session" title="Delete">×</button></a>';
+      }).join("") + "</div>";
+      recent.addEventListener("click", async (e) => {
+        const target = e.target.closest("[data-delete]");
+        if (!target) return;
+        e.preventDefault();
+        await store.remove(target.dataset.delete);
+        target.closest(".recent-item").remove();
+        if (!recent.querySelector(".recent-item")) recent.hidden = true;
+      });
+    }
   }
 
-  // --- Working -------------------------------------------------------------------
+  // --- Making a session ----------------------------------------------------------
   const STEPS = [["captions", "Getting the video’s captions"], ["handwriting", "Reading your handwriting"], ["matching", "Finding each line’s moment"]];
 
-  function renderWorking(step) {
+  function renderWorking(progress) {
     document.title = "Linking… · Margin";
     barTitle.innerHTML = "";
     barActions.innerHTML = "";
-    const current = Math.max(0, STEPS.findIndex((s) => s[0] === step));
+    clearInterval(state.demoTimer);
     view.innerHTML = '<div class="working"><h1>Linking your notes</h1><ol class="steps">' +
-      STEPS.map((s, i) => '<li class="' + (i < current ? "done" : i === current ? "now" : "") + '"><span class="dot">' + (i < current ? "✓" : "") + "</span>" + s[1] + "</li>").join("") +
-      '</ol><p class="hint">This usually takes 10 to 20 seconds. The first run also downloads a small language model.</p></div>';
+      STEPS.map((s) => '<li class="' + (progress[s[0]] || "") + '"><span class="dot">' + (progress[s[0]] === "done" ? "✓" : "") + "</span>" + s[1] + "</li>").join("") +
+      '</ol><p class="hint">This usually takes 10 to 20 seconds.</p></div>';
+  }
+
+  async function createSession() {
+    if (state.busy) return;
+    state.busy = true;
+    const progress = { captions: "now", handwriting: "now", matching: "" };
+    renderWorking(progress);
+    const step = (name, value) => { progress[name] = value; if (state.busy) renderWorking(progress); };
+    try {
+      const photo = await shrink(draft.file, 2000);
+      const captionFields = { video_url: draft.url.trim() };
+      if (draft.showTranscript && draft.transcript.trim()) captionFields.transcript = draft.transcript;
+      const readFields = { notes: photo.blob };
+      if (!photo.converted) readFields.return_image = "1";
+      const captionsCall = api("/api/captions", { method: "POST", body: form(captionFields) }).then((r) => { step("captions", "done"); return r; });
+      const readCall = api("/api/read", { method: "POST", body: form(readFields) }).then((r) => { step("handwriting", "done"); return r; });
+      const [video, page] = await Promise.all([captionsCall, readCall]);
+      step("matching", "now");
+      const linked = await api("/api/link", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ captions: video.captions, lines: page.lines }),
+      });
+      const session = {
+        id: newId(), created: Date.now(), video: video.video, page: page.page, reader: page.reader,
+        matching: linked.matching, lines: linked.lines, map: linked.map, captions: video.captions,
+        image: page.image ? await dataUrlToBlob(page.image) : photo.blob,
+      };
+      await store.put(session);
+      state.busy = false;
+      draft.error = null;
+      if (location.hash === "#/s/" + session.id) route(); else location.hash = "#/s/" + session.id;
+    } catch (err) {
+      state.busy = false;
+      draft.error = (err && err.error) || "Something went wrong while linking your notes.";
+      if (err && err.code === "captions") draft.showTranscript = true;
+      renderHome();
+    }
   }
 
   async function openSession(id) {
-    clearTimeout(state.pollTimer);
-    let data;
-    try {
-      data = await api("/api/sessions/" + id);
-    } catch (err) {
-      draft.error = err.error;
+    const session = await store.get(id);
+    if (!location.hash.includes(id)) return; // navigated away meanwhile
+    if (!session) {
+      draft.error = "That session isn't saved in this browser.";
       location.hash = "#/";
       return;
     }
-    if (!location.hash.includes(id)) return; // navigated away meanwhile
-    if (data.status === "working") {
-      renderWorking(data.step);
-      state.pollTimer = setTimeout(() => openSession(id), 700);
-    } else if (data.status === "error") {
-      draft.error = data.error;
-      if (data.code === "captions") draft.showTranscript = true;
-      api("/api/sessions/" + id, { method: "DELETE" }).catch(() => {});
-      location.hash = "#/";
-    } else {
-      state.session = data;
-      renderSession();
-    }
+    state.session = session;
+    state.imageUrl = session.image ? URL.createObjectURL(session.image) : "";
+    renderSession();
   }
 
   // --- Session ---------------------------------------------------------------------
   function teardownSession() {
-    clearTimeout(state.pollTimer);
     clearInterval(state.ticker);
+    clearInterval(state.demoTimer);
     if (state.player && state.player.destroy) { try { state.player.destroy(); } catch (e) { /* already gone */ } }
-    Object.assign(state, { session: null, selected: null, player: null, playerReady: false, pendingSeek: null, playingLine: null, activeCaption: -1 });
+    if (state.imageUrl) URL.revokeObjectURL(state.imageUrl);
+    Object.assign(state, { session: null, imageUrl: null, selected: null, player: null, playerReady: false, pendingSeek: null, playingLine: null, activeCaption: -1 });
     closeMap();
   }
 
@@ -267,8 +414,12 @@
     const title = s.video.title || "Your notes";
     document.title = title + " · Margin";
     barTitle.innerHTML = "<strong>" + esc(title) + "</strong>" + (s.video.author ? " · " + esc(s.video.author) : "");
-    barActions.innerHTML = '<button class="button quiet" id="open-map" title="See how the lines were matched (M)">How it matched</button><a class="button" href="#/">New</a>';
+    barActions.innerHTML =
+      '<button class="button quiet" id="open-map" title="See how the lines were matched (M)">How it matched</button>' +
+      '<button class="button quiet" id="download" title="Save this session as a file">Download</button>' +
+      '<a class="button" href="#/">New</a>';
     document.getElementById("open-map").addEventListener("click", openMap);
+    document.getElementById("download").addEventListener("click", downloadSession);
 
     const anyBox = s.lines.some((l) => l.box);
     state.mode = anyBox ? "page" : "text";
@@ -327,7 +478,7 @@
     document.getElementById("count").textContent = linked + " of " + s.lines.length + " lines linked";
 
     if (state.mode === "page") {
-      host.innerHTML = '<div class="page"><img alt="Your notes" src="/api/sessions/' + esc(s.id) + '/page.jpg">' +
+      host.innerHTML = '<div class="page"><img alt="Your notes" src="' + esc(state.imageUrl) + '">' +
         s.lines.filter((l) => l.box).map((l) => {
           const [x0, y0, x1, y1] = l.box;
           const pad = 0.004;
@@ -406,10 +557,10 @@
     document.getElementById("pin").addEventListener("click", () => {
       const t = currentTime();
       if (t == null) { toast("Start the video first, then set the moment."); return; }
-      updateLine(l.i, { t: Math.max(0, t - 1) }, "Linked to " + clock(t));
+      updateLine(l.i, { pinned: true, t: Math.max(0, Math.round((t - 1) * 100) / 100) }, "Linked to " + clock(t));
     });
     const unpin = document.getElementById("unpin");
-    if (unpin) unpin.addEventListener("click", () => updateLine(l.i, { t: null }, "Back to the automatic match"));
+    if (unpin) unpin.addEventListener("click", () => updateLine(l.i, { pinned: false }, "Back to the automatic match"));
     document.getElementById("edit-line").addEventListener("click", () => editLine(l));
   }
 
@@ -437,18 +588,45 @@
     input.addEventListener("blur", () => finish(true));
   }
 
+  /** Apply a correction to one line, then ask the server to link everything again. */
   async function updateLine(index, change, message) {
+    const session = state.session;
+    const lines = session.lines.map((l) => {
+      const line = { text: l.text, box: l.box, pinned: !!l.pinned, t: l.pinned ? l.t : null };
+      if (l.i === index) {
+        if ("text" in change) line.text = change.text;
+        if ("pinned" in change) { line.pinned = change.pinned; line.t = change.pinned ? change.t : null; }
+      }
+      return line;
+    });
     try {
-      const updated = await api("/api/sessions/" + state.session.id + "/lines/" + index, {
-        method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(change),
+      const linked = await api("/api/link", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ captions: session.captions, lines }),
       });
-      state.session = updated;
+      if (state.session !== session) return;
+      Object.assign(session, { lines: linked.lines, map: linked.map, matching: linked.matching });
+      await store.put(session);
       paintNotes(); paintTimeline(); paintNow();
       if (message) toast(message);
     } catch (err) {
       toast(err.error);
       paintNow();
     }
+  }
+
+  async function downloadSession() {
+    const s = state.session;
+    const copy = Object.assign({}, s);
+    delete copy.image;
+    const bundle = { margin: 1, session: copy, image: s.image ? await blobToDataUrl(s.image) : null };
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(new Blob([JSON.stringify(bundle)], { type: "application/json" }));
+    link.download = "margin-session.json";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(link.href), 2000);
   }
 
   function paintCaptions() {
@@ -586,7 +764,7 @@
   function drawMap() {
     const map = state.session.map, lines = state.session.lines;
     const styles = getComputedStyle(document.documentElement);
-    const ink = styles.getPropertyValue("--ink").trim(), muted = styles.getPropertyValue("--muted").trim();
+    const muted = styles.getPropertyValue("--muted").trim();
     const rule = styles.getPropertyValue("--rule").trim(), sunk = styles.getPropertyValue("--sunk").trim();
     const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
     const rows = map.cells.length, cols = map.columns;
@@ -633,7 +811,6 @@
       if (l.t == null) return;
       ctx.beginPath(); ctx.arc(gutter + (l.t / total) * plotWidth, r * rowHeight + rowHeight / 2, Math.min(4, rowHeight / 2.6), 0, Math.PI * 2); ctx.fill();
     });
-    ctx.strokeStyle = ink;
     mapGeometry = { gutter, plotWidth, rowHeight, rows, total };
   }
 

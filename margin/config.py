@@ -6,7 +6,9 @@ import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = Path(os.environ.get("MARGIN_DATA_DIR", ROOT / "data"))
+# Caches (captions, handwriting readings, embeddings) live here. Serverless hosts only allow /tmp.
+_default_data = Path("/tmp/margin") if os.environ.get("VERCEL") else ROOT / "data"
+DATA_DIR = Path(os.environ.get("MARGIN_DATA_DIR", _default_data))
 WEB_DIR = Path(__file__).resolve().parent / "web"
 
 

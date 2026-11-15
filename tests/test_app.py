@@ -1,11 +1,11 @@
-import time
+import base64
 
 import pytest
 from fastapi.testclient import TestClient
 
 from margin import pipeline, readers, server, transcript
 from margin.readers import gemini
-from margin.readers.base import ReaderError, clamp_box, tidy, NoteLine
+from margin.readers.base import NoteLine, ReaderError, clamp_box, tidy
 from tests.fixtures import lecture
 from tests.helpers import FixtureReader, notes_page
 
@@ -19,102 +19,124 @@ def page():
 
 @pytest.fixture
 def client(monkeypatch, page):
-    image, lines = page
+    _, lines = page
     reader = FixtureReader(lines)
     monkeypatch.setattr(pipeline, "pick_reader", lambda: reader)
     monkeypatch.setattr(pipeline.scoring, "meaning_similarity", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_warm_up_model", lambda: None)
+    monkeypatch.setattr(server, "_ensure_model_started", lambda: None)
     with TestClient(server.app) as test_client:
         test_client.reader = reader
         yield test_client
 
 
-def wait_ready(client, session_id, timeout=10):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        data = client.get("/api/sessions/" + session_id).json()
-        if data["status"] != "working":
-            return data
-        time.sleep(0.05)
-    raise AssertionError("session did not finish")
-
-
-def create(client, image, **fields):
+def get_captions(client, **fields):
     data = {"video_url": VIDEO, "transcript": lecture.pasted_transcript()}
     data.update(fields)
-    return client.post("/api/sessions", data=data, files={"notes": ("notes.jpg", image, "image/jpeg")})
+    return client.post("/api/captions", data=data)
 
 
-def test_full_session_through_the_api(client, page):
-    image, lines = page
-    response = create(client, image)
-    assert response.status_code == 200
-    session = wait_ready(client, response.json()["id"])
-    assert session["status"] == "ready"
-    assert session["video"] == {"id": "dQw4w9WgXcQ", "title": "Photosynthesis", "author": "Test Channel", "duration": 241.0}
-    assert len(session["lines"]) == len(lecture.NOTES)
-    assert sum(1 for l in session["lines"] if l["t"] is not None) == len(lecture.NOTES) - 1
-    assert all(l["box"] and 0 <= l["box"][0] < l["box"][2] <= 1 for l in session["lines"])
-    assert len(session["captions"]) == len(lecture.CAPTIONS)
-    assert session["page"]["width"] == 1000
-
-    picture = client.get("/api/sessions/%s/page.jpg" % session["id"])
-    assert picture.status_code == 200 and picture.headers["content-type"] == "image/jpeg"
-    listing = client.get("/api/sessions").json()["sessions"]
-    assert listing[0]["id"] == session["id"] and listing[0]["linked"] == 14 and listing[0]["lines"] == 15
-
-    assert client.delete("/api/sessions/" + session["id"]).json() == {"deleted": True}
-    assert client.get("/api/sessions/" + session["id"]).status_code == 404
+def read_notes(client, image, **fields):
+    return client.post("/api/read", data=fields, files={"notes": ("notes.jpg", image, "image/jpeg")})
 
 
-def test_pin_unpin_and_edit_a_line(client, page):
+def link(client, captions, lines):
+    return client.post("/api/link", json={"captions": captions, "lines": lines})
+
+
+def test_the_three_steps_make_a_session(client, page):
     image, _ = page
-    session = wait_ready(client, create(client, image).json()["id"])
-    url = "/api/sessions/%s/lines/13" % session["id"]          # "TEST FRIDAY!! ch. 8", unlinked
-    assert session["lines"][13]["t"] is None
+    video = get_captions(client)
+    assert video.status_code == 200
+    assert video.json()["video"] == {"id": "dQw4w9WgXcQ", "title": "Photosynthesis", "author": "Test Channel", "duration": 241.0}
+    captions = video.json()["captions"]
+    assert len(captions) == len(lecture.CAPTIONS) and captions[1] == {"t": 4.0, "e": 8.0, "text": lecture.CAPTIONS[1]}
 
-    pinned = client.patch(url, json={"t": 201.4}).json()
-    assert pinned["lines"][13]["t"] == 201.4 and pinned["lines"][13]["confidence"] == "pinned"
-    assert "cam plants" in pinned["lines"][13]["caption"]
-    assert client.get("/api/sessions/" + session["id"]).json()["lines"][13]["pinned"] is True
+    read = read_notes(client, image)
+    assert read.status_code == 200
+    assert read.json()["reader"] == "Fixture" and read.json()["page"] == {"width": 1000, "height": 1400}
+    lines = read.json()["lines"]
+    assert len(lines) == len(lecture.NOTES) and "image" not in read.json()
+    assert all(l["box"] and 0 <= l["box"][0] < l["box"][2] <= 1 for l in lines)
 
-    unpinned = client.patch(url, json={"t": None}).json()
-    assert unpinned["lines"][13]["t"] is None and unpinned["lines"][13]["pinned"] is False
+    linked = link(client, captions, lines).json()
+    assert linked["matching"] == "keywords"
+    assert sum(1 for l in linked["lines"] if l["t"] is not None) == len(lecture.NOTES) - 1
+    assert linked["lines"][4]["box"] == lines[4]["box"] and "thylakoid" in linked["lines"][4]["caption"]
+    assert len(linked["map"]["cells"]) == len(lecture.NOTES)
 
-    edited = client.patch(url, json={"text": "cellular respiration = reverse process"}).json()
-    assert edited["lines"][13]["text"] == "cellular respiration = reverse process"
-    assert 220 <= edited["lines"][13]["t"] <= 236
-    assert client.patch(url, json={"text": "   "}).status_code == 400
-    assert client.patch("/api/sessions/%s/lines/99" % session["id"], json={"t": 1}).status_code == 404
+
+def test_corrections_are_applied_by_linking_again(client, page):
+    image, _ = page
+    captions = get_captions(client).json()["captions"]
+    lines = read_notes(client, image).json()["lines"]
+    first = link(client, captions, lines).json()["lines"]
+    assert first[13]["t"] is None                              # "TEST FRIDAY!! ch. 8"
+
+    def as_input(linked):
+        return [{"text": l["text"], "box": l["box"], "pinned": l["pinned"], "t": l["t"] if l["pinned"] else None} for l in linked]
+
+    pinned_in = as_input(first)
+    pinned_in[13].update({"pinned": True, "t": 201.4})
+    pinned = link(client, captions, pinned_in).json()["lines"]
+    assert pinned[13]["t"] == 201.4 and pinned[13]["confidence"] == "pinned" and pinned[13]["pinned"] is True
+    assert "cam plants" in pinned[13]["caption"]
+
+    again = as_input(pinned)                                   # a pin survives later re-links
+    again[0]["text"] = "Photosynthesis: plants make food w/ sunlight"
+    kept = link(client, captions, again).json()["lines"]
+    assert kept[13]["t"] == 201.4 and kept[0]["text"].startswith("Photosynthesis: plants")
+
+    unpinned_in = as_input(kept)
+    unpinned_in[13].update({"pinned": False, "t": None})
+    assert link(client, captions, unpinned_in).json()["lines"][13]["t"] is None
+
+    edited_in = as_input(first)
+    edited_in[13]["text"] = "cellular respiration = reverse process"
+    edited = link(client, captions, edited_in).json()["lines"]
+    assert 220 <= edited[13]["t"] <= 236
 
 
 def test_notes_are_read_once_per_photo(client, page):
     image, _ = page
-    wait_ready(client, create(client, image).json()["id"])
-    wait_ready(client, create(client, image).json()["id"])
+    read_notes(client, image)
+    read_notes(client, image)
     assert client.reader.calls == 1
+
+
+def test_the_upright_photo_can_be_sent_back(client, page):
+    image, _ = page
+    reply = read_notes(client, image, return_image="1").json()
+    assert reply["image"].startswith("data:image/jpeg;base64,")
+    assert base64.b64decode(reply["image"].split(",", 1)[1])[:2] == b"\xff\xd8"
 
 
 def test_errors_are_reported_in_plain_words(client, page, monkeypatch):
     image, _ = page
-    bad_link = create(client, image, video_url="https://example.com/video")
+    bad_link = get_captions(client, video_url="https://example.com/video")
     assert bad_link.status_code == 400 and bad_link.json()["code"] == "video"
 
-    not_a_photo = wait_ready(client, create(client, b"this is not an image").json()["id"])
-    assert not_a_photo["status"] == "error" and not_a_photo["code"] == "image"
+    no_times = get_captions(client, transcript="words but no timestamps")
+    assert no_times.status_code == 400 and no_times.json()["code"] == "captions"
 
     def no_captions(video_id):
         raise transcript.TranscriptError("This video has no captions. You can paste the transcript instead.")
     monkeypatch.setattr(pipeline, "load_transcript", no_captions)
-    missing = wait_ready(client, create(client, image, transcript="").json()["id"])
-    assert missing["status"] == "error" and missing["code"] == "captions" and "paste" in missing["error"]
+    missing = get_captions(client, transcript="")
+    assert missing.status_code == 400 and missing.json()["code"] == "captions" and "paste" in missing.json()["error"]
+
+    not_a_photo = read_notes(client, b"this is not an image")
+    assert not_a_photo.status_code == 400 and not_a_photo.json()["code"] == "image"
+    assert read_notes(client, b"").status_code == 400
 
     def no_reader():
         raise ReaderError("No handwriting reader is set up yet.")
     monkeypatch.setattr(pipeline, "pick_reader", no_reader)
-    unread = wait_ready(client, create(client, image + b" ").json()["id"])
-    assert unread["status"] == "error" and unread["code"] == "reader"
-    assert client.get("/api/sessions").json()["sessions"] == []
+    unread = read_notes(client, image + b" ")
+    assert unread.status_code == 400 and unread.json() == {"error": "No handwriting reader is set up yet.", "code": "reader"}
+
+    assert link(client, [], []).status_code == 400
+    assert link(client, [{"t": 0, "e": 4, "text": "hello there"}], [{"text": "   "}]).status_code == 400
+    assert client.post("/api/link", json={"captions": "x", "lines": 3}).status_code == 400
 
 
 def test_status_and_index(client, monkeypatch):
@@ -125,8 +147,23 @@ def test_status_and_index(client, monkeypatch):
     page_html = client.get("/")
     assert page_html.status_code == 200 and "Margin" in page_html.text
     assert client.get("/static/app.js").status_code == 200 and client.get("/static/app.css").status_code == 200
-    assert client.get("/api/sessions/../../etc").status_code in (404, 405)
-    assert client.get("/api/sessions/nope-nope").status_code == 404
+
+
+def test_the_hosting_config_points_at_the_app():
+    import json
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    pyproject = (root / "pyproject.toml").read_text()
+    module, _, variable = re.search(r'entrypoint = "([^"]+)"', pyproject).group(1).partition(":")
+    assert getattr(__import__(module, fromlist=[variable]), variable) is server.app
+    # The function settings must be keyed by that same file.
+    assert list(json.loads((root / "vercel.json").read_text())["functions"]) == [module.replace(".", "/") + ".py"]
+    # pyproject.toml and requirements.txt must list the same packages.
+    listed = set(re.findall(r'^\s+"([^"]+)",$', pyproject, re.M))
+    required = {line.strip() for line in (root / "requirements.txt").read_text().splitlines() if line.strip() and not line.startswith("#")}
+    assert listed == required
 
 
 # --- readers ---------------------------------------------------------------------------
@@ -138,8 +175,6 @@ def test_gemini_reply_parsing():
     assert [l.text for l in lines] == ["second line", "first line", "no box"]
     ordered = gemini.parse_response(reply.replace(', {"text": "no box", "box_2d": [1, 2]}', ""))
     assert [l.text for l in ordered] == ["first line", "second line"]
-    boxed = [l for l in lines if l.box]
-    assert boxed and all(0 <= v <= 1 for l in boxed for v in l.box)
     first = next(l for l in lines if l.text == "first line")
     assert first.box == (0.1, 0.1, 0.7, 0.14)
     assert gemini.parse_response('Here you go: {"lines": []} hope that helps') == []

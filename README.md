@@ -101,16 +101,38 @@ margin/
   scoring.py      keyword and meaning evidence
   align.py        the in-order alignment, alternatives, the match map
   readers/        handwriting readers: Gemini, Apple Vision
-  pipeline.py     builds a session end to end, with caching
-  store.py        sessions on disk
-  server.py       JSON API (FastAPI)
+  pipeline.py     the three steps: captions, reading, linking (with caching)
+  server.py       three stateless endpoints (FastAPI) and the interface
   doctor.py       setup check
   web/            the interface: plain HTML, CSS and JavaScript, no build step
-tests/            33 tests, including a full lecture aligned end to end
+pyproject.toml    tells a serverless host where the app is
+tests/            35 tests, including a full lecture aligned end to end
 ```
 
-Sessions, cached captions and cached handwriting readings live in `data/`.
-Delete that folder to start fresh.
+The server stores nothing. Each session (the photo, the lines, the links) is
+kept in your browser, and **Download** saves one as a file. Cached captions and
+handwriting readings live in `data/`; delete that folder to start fresh.
+
+## Hosting it
+
+Margin runs on Vercel as it is (`pyproject.toml` and `vercel.json` point it at the app):
+
+1. Import the repository at vercel.com and keep the default settings.
+2. Add an environment variable `GEMINI_API_KEY`. Apple Vision only exists on a
+   Mac, so the hosted copy needs Gemini to read handwriting.
+3. Deploy.
+
+Three things differ from running it on your own machine:
+
+- Matching uses keywords only. The meaning model is too large for a serverless
+  function.
+- YouTube often refuses caption requests that come from cloud servers. When it
+  does, Margin asks you to paste the transcript.
+- Uploads are limited to about 4 MB, so photos are shrunk in the browser first.
+
+To give visitors something to try without their own notes, make a session
+locally, press **Download**, save the file as `margin/web/sample.json` and
+commit it. A **Try a sample** button then appears on the home page.
 
 ## Tests
 
@@ -125,6 +147,7 @@ alignment really does find the best-scoring set of links.
 ## Limits
 
 - One page per session.
+- Sessions are saved in the browser you made them in. Use Download to move one.
 - English works best; the keyword shorthand list is English.
 - Handwriting that a person can't read, Margin can't either. Fix a misread line
   with the pencil.

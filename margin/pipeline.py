@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
 import logging
-import time
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import List, Optional
 
 from . import align, config, scoring, transcript
 from .readers import NoteLine, Reader, pick_reader
@@ -17,7 +17,6 @@ from .transcript import Segment, TranscriptError
 
 log = logging.getLogger("margin.pipeline")
 
-Progress = Callable[[str], None]
 MAX_IMAGE_SIDE = 2200
 
 
@@ -170,29 +169,15 @@ def nearest_segment(segments: List[Segment], t: float) -> int:
     return best
 
 
-# --- The whole thing ------------------------------------------------------------------------
+# --- The steps the server exposes ---------------------------------------------------------
 
 
-def build_session(
-    session_dir: Path,
-    video_url: str,
-    image_bytes: bytes,
-    pasted_transcript: str = "",
-    progress: Optional[Progress] = None,
-    reader: Optional[Reader] = None,
-) -> dict:
-    """Run every step and return the finished session payload. Raises PipelineError."""
-    progress = progress or (lambda step: None)
-    started = time.time()
-
+def get_captions(video_url: str, pasted_transcript: str = "") -> dict:
+    """Video details and timestamped captions. Raises PipelineError."""
     try:
         video_id = transcript.parse_video_id(video_url)
     except TranscriptError as exc:
         raise PipelineError(str(exc), "video") from exc
-
-    page = prepare_image(image_bytes, session_dir / "page.jpg")
-
-    progress("captions")
     try:
         if pasted_transcript.strip():
             segments = transcript.parse_pasted(pasted_transcript)
@@ -201,22 +186,6 @@ def build_session(
     except TranscriptError as exc:
         raise PipelineError(str(exc), "captions") from exc
     meta = transcript.fetch_video_meta(video_id)
-
-    progress("handwriting")
-    try:
-        reader = reader or pick_reader()
-        notes = read_notes(session_dir / "page.jpg", page["hash"], reader)
-    except ReaderError as exc:
-        raise PipelineError(str(exc), "reader") from exc
-    if not notes:
-        raise PipelineError(
-            "Couldn't find any handwriting in that photo. Try a sharper, well-lit photo taken from straight above.",
-            "reader",
-        )
-
-    progress("matching")
-    linked = link_lines([line.to_dict() for line in notes], segments)
-
     return {
         "video": {
             "id": video_id,
@@ -224,23 +193,30 @@ def build_session(
             "author": meta.get("author", ""),
             "duration": round(transcript.duration_of(segments), 1),
         },
-        "page": {"width": page["width"], "height": page["height"]},
-        "reader": reader.label,
-        "matching": linked["matching"],
-        "lines": linked["lines"],
-        "map": linked["map"],
         "captions": [{"t": round(s.start, 2), "e": round(s.end, 2), "text": s.text} for s in segments],
-        "seconds": round(time.time() - started, 1),
     }
 
 
-def relink(session: dict) -> dict:
-    """Re-run matching on a stored session (after the user edits a line's text)."""
-    segments = [Segment(c["t"], c.get("e", c["t"]), c["text"]) for c in session["captions"]]
-    lines = [
-        {"text": line["text"], "box": line.get("box"), "pinned": line.get("pinned"), "t": line.get("t")}
-        for line in session["lines"]
-    ]
-    linked = link_lines(lines, segments)
-    session.update({"lines": linked["lines"], "map": linked["map"], "matching": linked["matching"]})
-    return session
+def read_page(
+    image_bytes: bytes, scratch_path: Path, reader: Optional[Reader] = None, return_image: bool = False
+) -> dict:
+    """Read the handwriting in a photo. `scratch_path` is where the normalised JPEG is written."""
+    page = prepare_image(image_bytes, scratch_path)
+    try:
+        reader = reader or pick_reader()
+        notes = read_notes(scratch_path, page["hash"], reader)
+    except ReaderError as exc:
+        raise PipelineError(str(exc), "reader") from exc
+    if not notes:
+        raise PipelineError(
+            "Couldn't find any handwriting in that photo. Try a sharper, well-lit photo taken from straight above.",
+            "reader",
+        )
+    result = {
+        "reader": reader.label,
+        "page": {"width": page["width"], "height": page["height"]},
+        "lines": [line.to_dict() for line in notes],
+    }
+    if return_image:
+        result["image"] = "data:image/jpeg;base64," + base64.b64encode(scratch_path.read_bytes()).decode("ascii")
+    return result
